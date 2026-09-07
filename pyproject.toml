@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opentooltrimmer-parts"
+version = "0.1.0"
+description = "Dissect open-source Python repositories to find the smallest policy-compatible reusable capability slice."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Harley Bielke"}]
+license = {text = "MIT"}
+
+[project.scripts]
+opentooltrimmer = "opentooltrimmer.cli:main"

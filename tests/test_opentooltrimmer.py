@@ -1,0 +1,598 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from opentooltrimmer.core import dissect
+from opentooltrimmer.models import Decision
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _write_byte_preservation_repo(repo: Path) -> tuple[bytes, bytes]:
+    repo.mkdir()
+    (repo / "LICENSE").write_bytes(
+        (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+    )
+    cleaner = (
+        b"from helpers import clean_name\r\n"
+        b"\r\n"
+        b"def normalize_customer_name(value: str) -> str:\r\n"
+        b"    \"\"\"Normalize a customer name.\"\"\"\r\n"
+        b"    return clean_name(value)\r\n"
+    )
+    helper = (
+        b"# -*- coding: latin-1 -*-\n"
+        b"\n"
+        b"def clean_name(value: str) -> str:\n"
+        b"    \"\"\"Clean a caf\xe9 customer name.\"\"\"\n"
+        b"    return value.strip().lower()\n"
+    )
+    (repo / "cleaner.py").write_bytes(cleaner)
+    (repo / "helpers.py").write_bytes(helper)
+    (repo / "notes.bin").write_bytes(b"repository bytes not emitted\x00\xff")
+    return cleaner, helper
+
+
+def _write_repo(repo: Path, files: dict[str, bytes]) -> None:
+    repo.mkdir()
+    for relative, content in files.items():
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+
+class OpenToolTrimmerTests(unittest.TestCase):
+    def test_duplicate_validated_mit_license_documents_remain_eligible(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            mit = (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+            _write_repo(repo, {
+                "LICENSE": mit,
+                "LICENSE-COPY": mit,
+                "cleaner.py": b"def normalize_customer_name(value: str) -> str:\n    return value.strip().lower()\n",
+            })
+
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertEqual(receipt.license.spdx_id, "MIT")
+            self.assertEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertEqual(receipt.verification_status, "PASS")
+
+    def test_validated_mit_and_conflicting_gpl_license_documents_hold(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            _write_repo(repo, {
+                "LICENSE": (FIXTURES / "permissive_repo" / "LICENSE").read_bytes(),
+                "LICENSE-GPL": (FIXTURES / "gpl_repo" / "LICENSE").read_bytes(),
+                "cleaner.py": b"def normalize_customer_name(value: str) -> str:\n    return value.strip().lower()\n",
+            })
+
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertIsNone(receipt.license.spdx_id)
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertEqual(receipt.verification_status, "NOT_RUN")
+            self.assertFalse((root / "output" / "slice").exists())
+
+    def test_validated_mit_and_unknown_license_documents_hold(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            _write_repo(repo, {
+                "LICENSE": (FIXTURES / "permissive_repo" / "LICENSE").read_bytes(),
+                "LICENSE-RESTRICTIVE": b"Use is prohibited without separate written permission.\n",
+                "cleaner.py": b"def normalize_customer_name(value: str) -> str:\n    return value.strip().lower()\n",
+            })
+
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertIsNone(receipt.license.spdx_id)
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertEqual(receipt.verification_status, "NOT_RUN")
+            self.assertFalse((root / "output" / "slice").exists())
+
+    def test_unvalidated_license_forms_cannot_acquire(self):
+        license_samples = {
+            "apache": (
+                b"Apache License\nVersion 2.0\nAdditional restriction applies.\n",
+                ["Apache-2.0"],
+                None,
+            ),
+            "bsd": (
+                b"Redistribution and use in source and binary forms are permitted.\nAdditional restriction applies.\n",
+                ["BSD-2-Clause"],
+                None,
+            ),
+            "gpl": (
+                (FIXTURES / "gpl_repo" / "LICENSE").read_bytes(),
+                ["GPL-3.0"],
+                "GPL-3.0",
+            ),
+        }
+
+        for name, (license_bytes, allowlist, expected_spdx) in license_samples.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                repo = root / "repo"
+                _write_repo(repo, {
+                    "LICENSE": license_bytes,
+                    "cleaner.py": b"def normalize_customer_name(value: str) -> str:\n    return value.strip().lower()\n",
+                })
+
+                receipt = dissect(
+                    str(repo),
+                    "normalize customer name",
+                    "utility",
+                    root / "output",
+                    allowlist=allowlist,
+                )
+
+                self.assertEqual(receipt.decision, Decision.HOLD)
+                self.assertEqual(receipt.license.spdx_id, expected_spdx)
+                self.assertEqual(receipt.verification_status, "NOT_RUN")
+                self.assertFalse((root / "output" / "slice").exists())
+
+    def test_module_cli_entry_points_show_help(self):
+        repository_root = Path(__file__).parent.parent
+
+        for module in ("opentooltrimmer", "opentooltrimmer.cli"):
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, "-m", module, "--help"],
+                    cwd=repository_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("usage: opentooltrimmer", result.stdout)
+
+    def test_substantive_prefix_before_mit_license_holds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            prefixed = (
+                b"This document imposes an additional field-of-use condition.\n\n"
+                + (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+            )
+            _write_repo(repo, {
+                "LICENSE": prefixed,
+                "cleaner.py": b"def normalize_customer_name(value: str) -> str:\n    return value.strip().lower()\n",
+            })
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertIsNone(receipt.license.spdx_id)
+            self.assertEqual(receipt.verification_status, "NOT_RUN")
+            self.assertFalse((root / "output" / "slice").exists())
+
+    def test_verification_rejects_child_process_source_access(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            (repo / "LICENSE").write_bytes(
+                (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+            )
+            hidden = repo / "hidden.py"
+            hidden.write_text("print('project-local-material')\n", encoding="utf-8")
+            (repo / "cleaner.py").write_text(
+                "def normalize_customer_name(\n"
+                f"    value: str, payload=__import__('subprocess').check_output([__import__('sys').executable, {str(hidden)!r}])\n"
+                ") -> str:\n"
+                "    return value.strip().lower()\n",
+                encoding="utf-8",
+            )
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertEqual(receipt.verification_status, "FAIL")
+            self.assertIn("child-process execution", receipt.verification_reason)
+            self.assertFalse(receipt.dependency_complete_v0_1)
+            self.assertFalse((root / "output" / "slice").exists())
+
+    def test_modified_mit_body_holds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            canonical = (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+            modified = canonical.replace(
+                b"without limitation the rights",
+                b"subject to additional limitations on the rights",
+                1,
+            )
+            _write_repo(repo, {
+                "LICENSE": modified,
+                "cleaner.py": b"def normalize_customer_name(value: str) -> str:\n    return value.strip().lower()\n",
+            })
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertIsNone(receipt.license.spdx_id)
+            self.assertEqual(receipt.verification_status, "NOT_RUN")
+            self.assertFalse((root / "output" / "slice").exists())
+
+    def test_comprehension_target_does_not_bind_enclosing_load(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            _write_repo(repo, {
+                "LICENSE": (FIXTURES / "permissive_repo" / "LICENSE").read_bytes(),
+                "cleaner.py": (
+                    b"def normalize_customer_name(value: str) -> str:\n"
+                    b"    [PREFIX for PREFIX in ()]\n"
+                    b"    return PREFIX + value\n"
+                ),
+            })
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertFalse(receipt.dependency_complete_v0_1)
+            self.assertIn("global:cleaner.py:PREFIX", receipt.unresolved_project_imports)
+            self.assertEqual(receipt.verification_status, "NOT_RUN")
+
+    def test_verification_rejects_direct_file_access_to_original_repository(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            (repo / "LICENSE").write_bytes(
+                (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+            )
+            hidden = repo / "hidden.py"
+            hidden.write_text("ESCAPED = True\n", encoding="utf-8")
+            (repo / "cleaner.py").write_text(
+                "def normalize_customer_name(\n"
+                f"    value: str, loaded=eval(compile(open({str(hidden)!r}).read(), {str(hidden)!r}, 'exec'), {{}})\n"
+                ") -> str:\n"
+                "    return value.strip().lower()\n",
+                encoding="utf-8",
+            )
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertEqual(receipt.verification_status, "FAIL")
+            self.assertIn("original repository", receipt.verification_reason)
+            self.assertFalse(receipt.dependency_complete_v0_1)
+            self.assertFalse((root / "output" / "slice").exists())
+
+    def test_stale_dependency_cannot_cause_false_acquire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            provider = root / "provider"
+            consumer = root / "consumer"
+            output = root / "output"
+            license_bytes = (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+            _write_repo(provider, {
+                "LICENSE": license_bytes,
+                "cleaner.py": (
+                    b"from helper import clean\n\n"
+                    b"def normalize_customer_name(value: str) -> str:\n"
+                    b"    return clean(value)\n"
+                ),
+                "helper.py": b"def clean(value: str) -> str:\n    return value.strip().lower()\n",
+            })
+            _write_repo(consumer, {
+                "LICENSE": license_bytes,
+                "cleaner.py": (
+                    b"import helper\n\n"
+                    b"def normalize_customer_name(value: str) -> str:\n"
+                    b"    return helper.clean(value)\n"
+                ),
+            })
+
+            first = dissect(str(provider), "normalize customer name", "utility", output)
+            self.assertEqual(first.decision, Decision.ACQUIRE)
+            self.assertTrue((output / "slice" / "helper.py").exists())
+
+            second = dissect(str(consumer), "normalize customer name", "utility", output)
+            self.assertEqual(second.decision, Decision.HOLD)
+            self.assertEqual(second.verification_status, "FAIL")
+            self.assertFalse(second.dependency_complete_v0_1)
+            self.assertFalse((output / "slice").exists())
+
+    def test_non_acquire_cleans_prior_tool_owned_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, repository, expected in (
+                ("hold", FIXTURES / "no_license_repo", Decision.HOLD),
+                ("point", FIXTURES / "gpl_repo", Decision.POINT_ONLY),
+            ):
+                with self.subTest(name=name):
+                    output = root / name
+                    dissect(
+                        str(FIXTURES / "permissive_repo"),
+                        "sha256 file hashing",
+                        "utility",
+                        output,
+                    )
+                    (output / "keep.txt").write_text("unrelated", encoding="utf-8")
+                    receipt = dissect(
+                        str(repository),
+                        "sha256 file hashing",
+                        "utility",
+                        output,
+                    )
+                    self.assertEqual(receipt.decision, expected)
+                    self.assertFalse((output / "slice").exists())
+                    self.assertFalse((output / "SOURCE_LICENSE.txt").exists())
+                    self.assertFalse((output / "PROVENANCE.md").exists())
+                    self.assertTrue((output / "keep.txt").exists())
+
+    def test_restrictive_terms_after_mit_license_hold(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            license_bytes = (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+            _write_repo(repo, {
+                "LICENSE": license_bytes + b"\nAdditional restriction: Commercial use is prohibited.\n",
+                "cleaner.py": b"def normalize_customer_name(value: str) -> str:\n    return value.strip().lower()\n",
+            })
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertIsNone(receipt.license.spdx_id)
+            self.assertIn("additional terms", receipt.license.reason)
+            self.assertEqual(receipt.verification_status, "NOT_RUN")
+            self.assertFalse((root / "output" / "slice").exists())
+
+    def test_nested_scope_assignment_does_not_bind_enclosing_load(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            _write_repo(repo, {
+                "LICENSE": (FIXTURES / "permissive_repo" / "LICENSE").read_bytes(),
+                "cleaner.py": (
+                    b"def normalize_customer_name(value: str) -> str:\n"
+                    b"    def unrelated_nested_scope():\n"
+                    b"        PREFIX = 'customer_'\n"
+                    b"        return PREFIX\n"
+                    b"    return PREFIX + value\n"
+                ),
+            })
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertFalse(receipt.dependency_complete_v0_1)
+            self.assertIn("global:cleaner.py:PREFIX", receipt.unresolved_project_imports)
+            self.assertEqual(receipt.verification_status, "NOT_RUN")
+
+    def test_verification_failure_clears_dependency_completeness(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "broken_import_repo"),
+                "normalize customer name",
+                "utility",
+                temp,
+            )
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertEqual(receipt.verification_status, "FAIL")
+            self.assertFalse(receipt.dependency_complete_v0_1)
+            self.assertFalse(receipt.code_emitted)
+            self.assertEqual(receipt.emitted_slice_bytes, 0)
+
+    def test_verification_rejects_imports_from_original_repository(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            (repo / "LICENSE").write_bytes(
+                (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+            )
+            (repo / "hidden.py").write_text(
+                "def clean(value):\n    return value.strip().lower()\n",
+                encoding="utf-8",
+            )
+            (repo / "cleaner.py").write_text(
+                "def normalize_customer_name(\n"
+                f"    value: str, helper=(__import__('sys').path.insert(0, {str(repo)!r}) or __import__('hidden'))\n"
+                ") -> str:\n"
+                "    return helper.clean(value)\n",
+                encoding="utf-8",
+            )
+            receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
+
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertEqual(receipt.verification_status, "FAIL")
+            self.assertIn("escaped to original repository", receipt.verification_reason)
+            self.assertFalse(receipt.dependency_complete_v0_1)
+            self.assertFalse((root / "output" / "slice").exists())
+
+    def test_permissive_complete_slice_acquires(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "permissive_repo"),
+                "sha256 file hashing",
+                "small internal utility",
+                temp,
+            )
+            self.assertEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertTrue((Path(temp) / "slice" / "hash_utils.py").exists())
+            self.assertTrue((Path(temp) / "SOURCE_LICENSE.txt").exists())
+            self.assertTrue(receipt.code_emitted)
+            self.assertEqual(receipt.verification_status, "PASS")
+
+    def test_non_allowlisted_recognized_license_points_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "gpl_repo"),
+                "sha256 file hashing",
+                "proprietary internal utility",
+                temp,
+            )
+            self.assertEqual(receipt.decision, Decision.POINT_ONLY)
+            self.assertFalse((Path(temp) / "slice").exists())
+            self.assertFalse(receipt.code_emitted)
+            self.assertEqual(receipt.verification_status, "NOT_RUN")
+
+    def test_missing_license_holds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "no_license_repo"),
+                "sha256 file hashing",
+                "small internal utility",
+                temp,
+            )
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertFalse((Path(temp) / "slice").exists())
+            self.assertEqual(receipt.verification_status, "NOT_RUN")
+
+    def test_cross_file_project_dependency_acquires(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "unresolved_repo"),
+                "normalize customer name",
+                "small internal utility",
+                temp,
+            )
+
+            self.assertEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertTrue(receipt.dependency_complete_v0_1)
+            self.assertEqual(receipt.unresolved_project_imports, [])
+            self.assertEqual(receipt.verification_status, "PASS")
+
+            slice_root = Path(temp) / "slice"
+            
+            self.assertTrue((slice_root / "cleaner.py").exists())
+            self.assertTrue((slice_root / "helpers" / "__init__.py").exists())
+
+    def test_module_attribute_project_dependency_holds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "module_attribute_repo"),
+                "normalize customer name",
+                "small internal utility",
+                temp,
+            )
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertFalse(receipt.dependency_complete_v0_1)
+            self.assertTrue(receipt.unresolved_project_imports)
+            self.assertFalse((Path(temp) / "slice").exists())
+
+    def test_broken_emitted_dependency_fails_verification_and_holds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "broken_import_repo"),
+                "normalize customer name",
+                "small internal utility",
+                temp,
+            )
+            self.assertEqual(receipt.decision, Decision.HOLD)
+            self.assertEqual(receipt.verification_status, "FAIL")
+            self.assertIn("import failed", receipt.verification_reason)
+            self.assertFalse(receipt.code_emitted)
+            self.assertFalse((Path(temp) / "slice").exists())
+
+    def test_same_file_global_constant_dependency_does_not_false_acquire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "global_constant_repo"),
+                "make customer name",
+                "small internal utility",
+                temp,
+            )
+            self.assertNotEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertFalse(receipt.dependency_complete_v0_1)
+            self.assertFalse((Path(temp) / "slice").exists())
+
+    def test_same_file_class_dependency_does_not_false_acquire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "global_class_repo"),
+                "normalize customer name",
+                "small internal utility",
+                temp,
+            )
+            self.assertNotEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertFalse(receipt.dependency_complete_v0_1)
+            self.assertTrue(receipt.unresolved_project_imports)
+            self.assertFalse((Path(temp) / "slice").exists())
+
+    def test_emitted_source_regions_preserve_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            output = root / "output"
+            cleaner, helper = _write_byte_preservation_repo(repo)
+
+            receipt = dissect(
+                str(repo),
+                "normalize customer name",
+                "small internal utility",
+                output,
+            )
+
+            self.assertEqual(receipt.decision, Decision.ACQUIRE)
+            emitted_cleaner = (output / "slice" / "cleaner.py").read_bytes()
+            emitted_helper = (output / "slice" / "helpers.py").read_bytes()
+            expected_function = cleaner[cleaner.index(b"def normalize_customer_name"):-2]
+            expected_helper_function = helper[helper.index(b"def clean_name"):-1]
+
+            self.assertEqual(emitted_cleaner[emitted_cleaner.index(b"def "):], expected_function)
+            self.assertEqual(emitted_cleaner, cleaner[:-2])
+            self.assertIn(b"\r\n", emitted_cleaner)
+            self.assertNotIn(b"\n", emitted_cleaner.replace(b"\r\n", b""))
+            self.assertEqual(
+                emitted_helper[emitted_helper.index(b"def clean_name"):],
+                expected_helper_function,
+            )
+            self.assertEqual(emitted_helper, helper[:-1])
+            self.assertIn(b"caf\xe9", emitted_helper)
+            self.assertNotIn(b"\r\n", emitted_helper)
+            compile(emitted_helper, "helpers.py", "exec")
+
+    def test_receipt_byte_accounting_matches_filesystem(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            output = root / "output"
+            _write_byte_preservation_repo(repo)
+            expected_source_bytes = sum(
+                path.stat().st_size for path in repo.rglob("*") if path.is_file()
+            )
+
+            receipt = dissect(
+                str(repo),
+                "normalize customer name",
+                "small internal utility",
+                output,
+            )
+            actual_emitted_bytes = sum(
+                path.stat().st_size
+                for path in (output / "slice").rglob("*")
+                if path.is_file()
+            )
+            receipt_json = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(receipt.source_repository_bytes, expected_source_bytes)
+            self.assertEqual(receipt.emitted_slice_bytes, actual_emitted_bytes)
+            self.assertEqual(receipt.trimmed_bytes, expected_source_bytes - actual_emitted_bytes)
+            self.assertEqual(receipt.trim_ratio, actual_emitted_bytes / expected_source_bytes)
+            self.assertEqual(receipt_json["source_repository_bytes"], expected_source_bytes)
+            self.assertEqual(receipt_json["emitted_slice_bytes"], actual_emitted_bytes)
+            self.assertEqual(receipt_json["trimmed_bytes"], receipt.trimmed_bytes)
+            self.assertEqual(receipt_json["trim_ratio"], receipt.trim_ratio)
+
+    def test_receipt_is_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dissect(
+                str(FIXTURES / "permissive_repo"),
+                "sha256 file hashing",
+                "small internal utility",
+                temp,
+            )
+            data = json.loads((Path(temp) / "receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(data["decision"], "ACQUIRE")
+            self.assertIn("source_snapshot_sha256", data)
+
+
+if __name__ == "__main__":
+    unittest.main()

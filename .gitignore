@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+opentooltrimmer_output/
+demo_output/
+demo_gpl/
+.pytest_cache/
+debug_output/
+build/
+dist/
+*.egg-info/
