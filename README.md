@@ -58,7 +58,7 @@ The current release can:
 - classify a deliberately small set of recognized license forms
 - distinguish policy-allowed acquisition from reference-only or unresolved cases
 - emit a dependency-complete source slice when the current evidence supports it
-- structurally verify that the emitted module imports and the selected callable exists
+- statically parse and compile emitted Python without executing it, confirm the selected function definition exists, and inspect supported import structure
 - preserve license and provenance evidence
 - produce byte accounting for the source snapshot and emitted slice
 - fail conservatively when the current implementation cannot prove a required condition
@@ -237,9 +237,9 @@ If removing something breaks one of those conditions, it was not excess.
 
 ## Verification boundary
 
-V0.1 performs structural verification.
+V0.1 performs non-executing structural verification.
 
-For an ACQUIRE candidate, it verifies that the emitted module can be imported under the current verification boundary and that the selected symbol resolves as a callable.
+For an ACQUIRE candidate, it parses and compiles every emitted Python file without executing the returned code object. It confirms that the selected module and top-level function definition are present, and checks that statically declared imports are either standard-library modules or represented in the emitted slice. For supported `from` imports, it also confirms that the named emitted definition exists.
 
 That is useful, but deliberately limited.
 
@@ -248,11 +248,11 @@ A PASS does not prove:
 - semantic correctness of the function
 - correctness for every possible input
 - runtime resource closure after the function is called
-- absence of every possible filesystem or process escape
-- OS-level sandbox containment
+- import-time or runtime behavior
+- runtime availability of external dependencies
 - safety of arbitrary native code
 
-OpenToolTrimmer contains conservative checks intended to prevent the original source repository from silently satisfying verification through supported Python-observable escape routes. These checks are not an operating-system security sandbox.
+Successful parsing and compilation prove only that Python accepted the emitted syntax and that the inspected static structure is present. Compile does not execute the candidate, and structural verification grants no authority to import or invoke it.
 
 ## Current V0.1 boundaries
 
@@ -270,7 +270,7 @@ Among the current limitations:
 - license classification is not legal advice
 - source snapshot byte accounting follows the tool's repository-ignore policy
 - exact preservation refers to included source regions, not necessarily a byte-identical reconstruction of the original whole file
-- no OS-level execution sandbox is claimed
+- verification does not import, execute, or call discovered candidate code
 
 These are boundaries, not promises hidden behind a green test result.
 
@@ -288,7 +288,7 @@ Always review the source project's license and your obligations before redistrib
 
 ## Testing
 
-The current V0.1 release has 27 tests passing.
+The current V0.1 release has 30 tests passing.
 
 The suite includes permanent regressions for failures discovered during external adversarial testing, including:
 
@@ -297,8 +297,8 @@ The suite includes permanent regressions for failures discovered during external
 - contradictory license modifications being treated as permissive
 - Python scope mistakes creating false dependency completeness
 - missing dependencies disagreeing with receipt claims
-- verification reaching back into the original repository
-- child-process verification escape
+- candidate module-level/default-expression side effects remaining unexecuted during verification
+- syntax-invalid and missing-symbol verification failures
 - CLI entry-point consistency
 
 The project was also tested using disposable external hostile fixtures before those failures were converted into permanent regressions.

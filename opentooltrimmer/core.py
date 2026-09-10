@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import ast
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -123,7 +123,6 @@ def dissect(
                 slice_root,
                 selected.file,
                 selected.name,
-                repo,
             )
             receipt.verification_status = verification_status
             receipt.verification_reason = verification_reason
@@ -188,94 +187,79 @@ def _verify_slice(
     slice_root: Path,
     selected_file: str,
     selected_name: str,
-    source_repo: Path,
 ) -> tuple[str, str]:
-    module_parts = Path(selected_file).with_suffix("").parts
-    if module_parts[-1] == "__init__":
-        module_parts = module_parts[:-1]
-    if not module_parts:
-        return "FAIL", f"could not derive an importable module from {selected_file}"
-    module_name = ".".join(module_parts)
+    parsed: dict[str, ast.Module] = {}
+    python_files = sorted(path for path in slice_root.rglob("*.py") if path.is_file())
 
-    script = """
-import importlib
-import sys
-from pathlib import Path
+    for path in python_files:
+        relative = path.relative_to(slice_root).as_posix()
+        try:
+            source = path.read_bytes()
+            tree = ast.parse(source, filename=relative)
+            compile(source, relative, "exec", dont_inherit=True)
+        except (OSError, SyntaxError, UnicodeError) as exc:
+            return "FAIL", f"static verification failed for {relative}: {type(exc).__name__}: {exc}"
+        parsed[relative] = tree
 
-slice_root, module_name, symbol_name, source_repo = sys.argv[1:]
-source_root = Path(source_repo).resolve()
+    selected_relative = Path(selected_file).as_posix()
+    selected_tree = parsed.get(selected_relative)
+    if selected_tree is None:
+        return "FAIL", f"selected module is absent from emitted slice: {selected_relative}"
 
-def reject_source_access(event, arguments):
-    if event in {"subprocess.Popen", "os.system", "os.posix_spawn", "os.posix_spawnp"}:
-        raise RuntimeError(f"verification blocked child-process execution during emitted-slice import: {event}")
-    if event != "open" or not arguments:
-        return
-    candidate = arguments[0]
-    if not isinstance(candidate, (str, bytes)):
-        return
-    try:
-        accessed = Path(candidate).resolve()
-    except (OSError, ValueError):
-        return
-    if accessed.is_relative_to(source_root):
-        raise RuntimeError(f"verification blocked access that escaped to original repository: {accessed}")
+    selected_symbols = {
+        node.name
+        for node in selected_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if selected_name not in selected_symbols:
+        return "FAIL", f"selected function definition is absent: {selected_relative}::{selected_name}"
 
-sys.addaudithook(reject_source_access)
-sys.path.insert(0, slice_root)
-try:
-    module = importlib.import_module(module_name)
-except Exception as exc:
-    print(f"import failed for {module_name}: {type(exc).__name__}: {exc}", file=sys.stderr)
-    raise SystemExit(2)
-module_file = getattr(module, "__file__", None)
-if module_file is None or not Path(module_file).resolve().is_relative_to(Path(slice_root).resolve()):
-    print(f"import failed for {module_name}: module did not load from the emitted slice", file=sys.stderr)
-    raise SystemExit(2)
-for loaded_name, loaded_module in tuple(sys.modules.items()):
-    loaded_file = getattr(loaded_module, "__file__", None)
-    if loaded_file is not None and Path(loaded_file).resolve().is_relative_to(source_root):
-        print(
-            f"import failed for {module_name}: {loaded_name} escaped to original repository at {loaded_file}",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-try:
-    symbol = getattr(module, symbol_name)
-except AttributeError:
-    print(f"symbol resolution failed: {module_name}.{symbol_name} does not exist", file=sys.stderr)
-    raise SystemExit(3)
-if not callable(symbol):
-    print(f"symbol resolution failed: {module_name}.{symbol_name} is not callable", file=sys.stderr)
-    raise SystemExit(4)
-"""
-    try:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                "-c",
-                script,
-                str(slice_root.resolve()),
-                module_name,
-                selected_name,
-                str(source_repo.resolve()),
-            ],
-            cwd=slice_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
-            check=False,
-            env={"PYTHONNOUSERSITE": "1"},
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return "FAIL", f"verification process failed: {type(exc).__name__}: {exc}"
+    for relative, tree in parsed.items():
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    return "FAIL", f"relative import is unsupported in emitted slice: {relative}"
+                modules = [node.module or ""]
+            else:
+                continue
 
-    if result.returncode != 0:
-        reason = result.stderr.strip() or f"verification process exited with status {result.returncode}"
-        return "FAIL", reason
-    return "PASS", f"imported {module_name} from the emitted slice and resolved callable {selected_name}"
+            for module in modules:
+                top = module.split(".")[0]
+                if top in sys.stdlib_module_names:
+                    continue
+                if _emitted_module_path(slice_root, module) is None:
+                    return "FAIL", f"import target is not standard-library or emitted: {module}"
+
+                if isinstance(node, ast.ImportFrom):
+                    target_path = _emitted_module_path(slice_root, module)
+                    target_tree = parsed.get(target_path.relative_to(slice_root).as_posix()) if target_path else None
+                    if target_tree is None:
+                        return "FAIL", f"emitted import target could not be inspected: {module}"
+                    available = {
+                        child.name
+                        for child in target_tree.body
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    }
+                    available.update(
+                        child.targets[0].id
+                        for child in target_tree.body
+                        if isinstance(child, ast.Assign)
+                        and len(child.targets) == 1
+                        and isinstance(child.targets[0], ast.Name)
+                    )
+                    for alias in node.names:
+                        if alias.name != "*" and alias.name not in available:
+                            return "FAIL", f"imported symbol is absent from emitted target: {module}:{alias.name}"
+
+    return "PASS", f"statically parsed and compiled emitted Python without execution; found {selected_relative}::{selected_name}"
+
+
+def _emitted_module_path(slice_root: Path, module: str) -> Path | None:
+    base = slice_root.joinpath(*module.split("."))
+    candidates = (base.with_suffix(".py"), base / "__init__.py")
+    return next((path for path in candidates if path.is_file()), None)
 
 
 def _write_receipt(output: Path, receipt: AnalysisReceipt) -> None:

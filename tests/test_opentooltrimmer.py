@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from opentooltrimmer.core import dissect
+from opentooltrimmer.core import _verify_slice, dissect
 from opentooltrimmer.models import Decision
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -174,7 +174,7 @@ class OpenToolTrimmerTests(unittest.TestCase):
             self.assertEqual(receipt.verification_status, "NOT_RUN")
             self.assertFalse((root / "output" / "slice").exists())
 
-    def test_verification_rejects_child_process_source_access(self):
+    def test_static_verification_does_not_execute_candidate_side_effect(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repo = root / "repo"
@@ -182,8 +182,12 @@ class OpenToolTrimmerTests(unittest.TestCase):
             (repo / "LICENSE").write_bytes(
                 (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
             )
+            sentinel = root / "candidate-executed.txt"
             hidden = repo / "hidden.py"
-            hidden.write_text("print('project-local-material')\n", encoding="utf-8")
+            hidden.write_text(
+                f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
             (repo / "cleaner.py").write_text(
                 "def normalize_customer_name(\n"
                 f"    value: str, payload=__import__('subprocess').check_output([__import__('sys').executable, {str(hidden)!r}])\n"
@@ -191,13 +195,14 @@ class OpenToolTrimmerTests(unittest.TestCase):
                 "    return value.strip().lower()\n",
                 encoding="utf-8",
             )
+            source_before = (repo / "cleaner.py").read_bytes()
             receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
 
-            self.assertEqual(receipt.decision, Decision.HOLD)
-            self.assertEqual(receipt.verification_status, "FAIL")
-            self.assertIn("child-process execution", receipt.verification_reason)
-            self.assertFalse(receipt.dependency_complete_v0_1)
-            self.assertFalse((root / "output" / "slice").exists())
+            self.assertEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertEqual(receipt.verification_status, "PASS")
+            self.assertIn("without execution", receipt.verification_reason)
+            self.assertFalse(sentinel.exists())
+            self.assertEqual((repo / "cleaner.py").read_bytes(), source_before)
 
     def test_modified_mit_body_holds(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -239,7 +244,7 @@ class OpenToolTrimmerTests(unittest.TestCase):
             self.assertIn("global:cleaner.py:PREFIX", receipt.unresolved_project_imports)
             self.assertEqual(receipt.verification_status, "NOT_RUN")
 
-    def test_verification_rejects_direct_file_access_to_original_repository(self):
+    def test_static_verification_does_not_read_candidate_default_expression(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repo = root / "repo"
@@ -258,11 +263,9 @@ class OpenToolTrimmerTests(unittest.TestCase):
             )
             receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
 
-            self.assertEqual(receipt.decision, Decision.HOLD)
-            self.assertEqual(receipt.verification_status, "FAIL")
-            self.assertIn("original repository", receipt.verification_reason)
-            self.assertFalse(receipt.dependency_complete_v0_1)
-            self.assertFalse((root / "output" / "slice").exists())
+            self.assertEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertEqual(receipt.verification_status, "PASS")
+            self.assertIn("without execution", receipt.verification_reason)
 
     def test_stale_dependency_cannot_cause_false_acquire(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -379,7 +382,7 @@ class OpenToolTrimmerTests(unittest.TestCase):
             self.assertFalse(receipt.code_emitted)
             self.assertEqual(receipt.emitted_slice_bytes, 0)
 
-    def test_verification_rejects_imports_from_original_repository(self):
+    def test_static_verification_does_not_run_dynamic_import_expression(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repo = root / "repo"
@@ -400,11 +403,9 @@ class OpenToolTrimmerTests(unittest.TestCase):
             )
             receipt = dissect(str(repo), "normalize customer name", "utility", root / "output")
 
-            self.assertEqual(receipt.decision, Decision.HOLD)
-            self.assertEqual(receipt.verification_status, "FAIL")
-            self.assertIn("escaped to original repository", receipt.verification_reason)
-            self.assertFalse(receipt.dependency_complete_v0_1)
-            self.assertFalse((root / "output" / "slice").exists())
+            self.assertEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertEqual(receipt.verification_status, "PASS")
+            self.assertIn("without execution", receipt.verification_reason)
 
     def test_permissive_complete_slice_acquires(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -487,9 +488,39 @@ class OpenToolTrimmerTests(unittest.TestCase):
             )
             self.assertEqual(receipt.decision, Decision.HOLD)
             self.assertEqual(receipt.verification_status, "FAIL")
-            self.assertIn("import failed", receipt.verification_reason)
+            self.assertIn("import target is not standard-library or emitted", receipt.verification_reason)
             self.assertFalse(receipt.code_emitted)
             self.assertFalse((Path(temp) / "slice").exists())
+
+    def test_static_verification_rejects_syntax_invalid_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            slice_root = Path(temp)
+            (slice_root / "candidate.py").write_bytes(b"def selected(:\n    pass\n")
+
+            status, reason = _verify_slice(slice_root, "candidate.py", "selected")
+
+            self.assertEqual(status, "FAIL")
+            self.assertIn("SyntaxError", reason)
+
+    def test_static_verification_rejects_absent_expected_symbol(self):
+        with tempfile.TemporaryDirectory() as temp:
+            slice_root = Path(temp)
+            (slice_root / "candidate.py").write_bytes(b"def other():\n    return 1\n")
+
+            status, reason = _verify_slice(slice_root, "candidate.py", "selected")
+
+            self.assertEqual(status, "FAIL")
+            self.assertIn("selected function definition is absent", reason)
+
+    def test_static_verification_accepts_valid_expected_symbol(self):
+        with tempfile.TemporaryDirectory() as temp:
+            slice_root = Path(temp)
+            (slice_root / "candidate.py").write_bytes(b"def selected():\n    return 1\n")
+
+            status, reason = _verify_slice(slice_root, "candidate.py", "selected")
+
+            self.assertEqual(status, "PASS")
+            self.assertIn("without execution", reason)
 
     def test_same_file_global_constant_dependency_does_not_false_acquire(self):
         with tempfile.TemporaryDirectory() as temp:
