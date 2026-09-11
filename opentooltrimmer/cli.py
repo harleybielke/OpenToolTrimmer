@@ -15,6 +15,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", required=True, help="Local repository path or public GitHub repository URL")
     parser.add_argument("--need", required=True, help="Plain-language capability request")
     parser.add_argument("--intended-use", required=True, help="Human-readable intended reuse context for the receipt")
+    parser.add_argument(
+        "--invocation-correlation-id",
+        required=True,
+        help="Opaque invocation correlation to preserve in the native receipt",
+    )
     parser.add_argument("--output", default="opentooltrimmer_output", help="Output directory")
     parser.add_argument(
         "--allow-license",
@@ -39,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
             intended_use=args.intended_use,
             output=Path(args.output),
             allowlist=allowlist,
+            invocation_correlation_id=args.invocation_correlation_id,
         )
     except Exception as exc:
         print(f"ERROR: {exc}")

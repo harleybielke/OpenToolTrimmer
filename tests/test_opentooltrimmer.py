@@ -6,7 +6,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from opentooltrimmer.cli import build_parser, main
 from opentooltrimmer.core import _verify_slice, dissect
 from opentooltrimmer.models import Decision
 
@@ -47,6 +50,118 @@ def _write_repo(repo: Path, files: dict[str, bytes]) -> None:
 
 
 class OpenToolTrimmerTests(unittest.TestCase):
+    def test_cli_requires_invocation_correlation(self):
+        with self.assertRaises(SystemExit) as raised:
+            build_parser().parse_args([
+                "--repo", "repo",
+                "--need", "need",
+                "--intended-use", "use",
+            ])
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_cli_passes_opaque_invocation_correlation_unchanged(self):
+        correlation = "attempt_id=not-an-attempt|authority:NOT-A-TOKEN/{opaque}?x=1"
+        native = SimpleNamespace(
+            decision=Decision.HOLD,
+            selected=None,
+            decision_reason="bounded test result",
+        )
+
+        with patch("opentooltrimmer.cli.dissect", return_value=native) as mocked:
+            result = main([
+                "--repo", "repo",
+                "--need", "need",
+                "--intended-use", "use",
+                "--invocation-correlation-id", correlation,
+                "--output", "output",
+            ])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            mocked.call_args.kwargs["invocation_correlation_id"],
+            correlation,
+        )
+
+    def test_core_echoes_independent_correlations_without_changing_results(self):
+        cases = (
+            ("first:{opaque}/value?x=1", FIXTURES / "permissive_repo", Decision.ACQUIRE, "MIT"),
+            ("second|not-a-uuid", FIXTURES / "gpl_repo", Decision.POINT_ONLY, "GPL-3.0"),
+            ("authority-token-looking:value", FIXTURES / "no_license_repo", Decision.HOLD, None),
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            emitted_without_receipt: dict[str, bytes] | None = None
+            for index, (correlation, repo, expected_decision, expected_license) in enumerate(cases):
+                output = root / str(index)
+                receipt = dissect(
+                    str(repo),
+                    "sha256 file hashing",
+                    "small internal utility",
+                    output,
+                    invocation_correlation_id=correlation,
+                )
+                serialized = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
+
+                self.assertEqual(receipt.invocation_correlation_id, correlation)
+                self.assertEqual(serialized["invocation_correlation_id"], correlation)
+                self.assertEqual(receipt.decision, expected_decision)
+                self.assertEqual(receipt.license.spdx_id, expected_license)
+
+                if expected_decision == Decision.ACQUIRE:
+                    current = {
+                        path.relative_to(output).as_posix(): path.read_bytes()
+                        for path in output.rglob("*")
+                        if path.is_file() and path.name != "receipt.json"
+                    }
+                    if emitted_without_receipt is None:
+                        emitted_without_receipt = current
+
+            second_output = root / "second-acquire"
+            second = dissect(
+                str(FIXTURES / "permissive_repo"),
+                "sha256 file hashing",
+                "small internal utility",
+                second_output,
+                invocation_correlation_id="independent-J",
+            )
+            second_files = {
+                path.relative_to(second_output).as_posix(): path.read_bytes()
+                for path in second_output.rglob("*")
+                if path.is_file() and path.name != "receipt.json"
+            }
+            self.assertEqual(second.invocation_correlation_id, "independent-J")
+            self.assertEqual(second.decision, Decision.ACQUIRE)
+            self.assertEqual(second_files, emitted_without_receipt)
+
+    def test_legacy_core_path_does_not_invent_correlation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "permissive_repo"),
+                "sha256 file hashing",
+                "small internal utility",
+                temp,
+            )
+            serialized = json.loads((Path(temp) / "receipt.json").read_text(encoding="utf-8"))
+
+            self.assertIsNone(receipt.invocation_correlation_id)
+            self.assertIsNone(serialized["invocation_correlation_id"])
+
+    def test_cli_failure_before_receipt_does_not_fabricate_correlation_testimony(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "output"
+            result = main([
+                "--repo", "not-a-local-repository-or-github-url",
+                "--need", "need",
+                "--intended-use", "use",
+                "--invocation-correlation-id", "opaque-I",
+                "--output", str(output),
+            ])
+
+            self.assertEqual(result, 2)
+            self.assertFalse((output / "receipt.json").exists())
+
     def test_duplicate_validated_mit_license_documents_remain_eligible(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

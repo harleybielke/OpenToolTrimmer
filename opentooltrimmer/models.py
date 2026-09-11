@@ -32,6 +32,7 @@ class CandidateFunction:
 @dataclass
 class AnalysisReceipt:
     opentooltrimmer_version: str
+    invocation_correlation_id: str | None
     requested_capability: str
     intended_use: str
     source: str

@@ -23,6 +23,7 @@ def dissect(
     intended_use: str,
     output: str | Path,
     allowlist: list[str] | tuple[str, ...] | None = None,
+    invocation_correlation_id: str | None = None,
 ) -> AnalysisReceipt:
     active_allowlist = tuple(allowlist or DEFAULT_ALLOWLIST)
     output_path = Path(output)
@@ -38,6 +39,7 @@ def dissect(
         if not candidates:
             receipt = AnalysisReceipt(
                 opentooltrimmer_version=__version__,
+                invocation_correlation_id=invocation_correlation_id,
                 requested_capability=need,
                 intended_use=intended_use,
                 source=resolved["source"],
@@ -79,6 +81,7 @@ def dissect(
 
         receipt = AnalysisReceipt(
             opentooltrimmer_version=__version__,
+            invocation_correlation_id=invocation_correlation_id,
             requested_capability=need,
             intended_use=intended_use,
             source=resolved["source"],
