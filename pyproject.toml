@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opentooltrimmer-parts"
-version = "0.1.1"
+version = "0.1.2"
 description = "Dissect open-source Python repositories to find the smallest policy-compatible reusable capability slice."
 readme = "README.md"
 requires-python = ">=3.11"
