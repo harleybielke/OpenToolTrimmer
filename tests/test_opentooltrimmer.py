@@ -637,7 +637,7 @@ class OpenToolTrimmerTests(unittest.TestCase):
             self.assertEqual(status, "PASS")
             self.assertIn("without execution", reason)
 
-    def test_same_file_global_constant_dependency_does_not_false_acquire(self):
+    def test_same_file_static_literal_dependency_acquires_exact_regions(self):
         with tempfile.TemporaryDirectory() as temp:
             receipt = dissect(
                 str(FIXTURES / "global_constant_repo"),
@@ -645,9 +645,74 @@ class OpenToolTrimmerTests(unittest.TestCase):
                 "small internal utility",
                 temp,
             )
-            self.assertNotEqual(receipt.decision, Decision.ACQUIRE)
-            self.assertFalse(receipt.dependency_complete_v0_1)
-            self.assertFalse((Path(temp) / "slice").exists())
+            self.assertEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertTrue(receipt.dependency_complete_v0_1)
+            self.assertEqual(receipt.unresolved_project_imports, [])
+            self.assertEqual(
+                receipt.resolved_static_bindings,
+                ["names.py::PREFIX"],
+            )
+            emitted = (Path(temp) / "slice" / "names.py").read_bytes()
+            self.assertIn(b'PREFIX = "customer_"', emitted)
+            self.assertIn(b"def make_customer_name", emitted)
+            self.assertNotIn(b"import pathlib", emitted)
+            self.assertNotIn(b"try:", emitted)
+
+    def test_filetype_shape_static_literal_dependency_is_complete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = dissect(
+                str(FIXTURES / "filetype_shape_repo"),
+                "get signature bytes",
+                "small internal utility",
+                temp,
+            )
+
+            self.assertEqual(receipt.decision, Decision.ACQUIRE)
+            self.assertTrue(receipt.dependency_complete_v0_1)
+            self.assertEqual(receipt.unresolved_project_imports, [])
+            self.assertEqual(
+                receipt.resolved_static_bindings,
+                ["utils.py::_NUM_SIGNATURE_BYTES"],
+            )
+            emitted = (Path(temp) / "slice" / "utils.py").read_bytes()
+            self.assertTrue(emitted.startswith(b"_NUM_SIGNATURE_BYTES = 8192"))
+            self.assertIn(b"open(path, 'rb')", emitted)
+            self.assertIn(b"bytearray(fp.read(_NUM_SIGNATURE_BYTES))", emitted)
+
+    def test_unsupported_module_bindings_remain_unresolved(self):
+        cases = {
+            "function_call": b"VALUE = compute_value()\n\ndef selected_value():\n    return VALUE\n",
+            "attribute_call": b'import os\nVALUE = os.getenv("VALUE")\n\ndef selected_value():\n    return VALUE\n',
+            "constructor": b"VALUE = SomeClass()\n\ndef selected_value():\n    return VALUE\n",
+            "class": b"class Formatter:\n    pass\n\ndef selected_value():\n    return Formatter()\n",
+            "other_global": b"VALUE = OTHER_GLOBAL\n\ndef selected_value():\n    return VALUE\n",
+            "multiple": b"VALUE = 1\nVALUE = 2\n\ndef selected_value():\n    return VALUE\n",
+            "mutation": b"VALUE = 1\nVALUE += 1\n\ndef selected_value():\n    return VALUE\n",
+            "global_rebind": (
+                b"VALUE = 1\n\ndef mutate():\n    global VALUE\n    VALUE = 2\n\n"
+                b"def selected_value():\n    return VALUE\n"
+            ),
+        }
+        for name, source in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                repo = root / "repo"
+                _write_repo(
+                    repo,
+                    {
+                        "LICENSE": (FIXTURES / "permissive_repo" / "LICENSE").read_bytes(),
+                        "candidate.py": source,
+                    },
+                )
+                receipt = dissect(
+                    str(repo), "selected value", "small internal utility", root / "output"
+                )
+
+                self.assertEqual(receipt.decision, Decision.HOLD)
+                self.assertFalse(receipt.dependency_complete_v0_1)
+                self.assertTrue(receipt.unresolved_project_imports)
+                self.assertEqual(receipt.resolved_static_bindings, [])
+                self.assertFalse((root / "output" / "slice").exists())
 
     def test_same_file_class_dependency_does_not_false_acquire(self):
         with tempfile.TemporaryDirectory() as temp:

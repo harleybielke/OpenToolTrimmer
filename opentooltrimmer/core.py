@@ -50,6 +50,7 @@ def dissect(
                 stdlib_imports=[],
                 third_party_imports=[],
                 unresolved_project_imports=[],
+                resolved_static_bindings=[],
                 dependency_complete_v0_1=False,
                 license=finding,
                 acquisition_allowlist=list(active_allowlist),
@@ -69,14 +70,25 @@ def dissect(
 
         selected = candidates[0]
         info = analyses[selected.file]
-        symbols, stdlib, third_party, unresolved, complete = trace_repository_dependencies(
-        analyses,
-        selected.file,
-        selected.name,
+        (
+            symbols,
+            stdlib,
+            third_party,
+            unresolved,
+            static_bindings,
+            complete,
+        ) = trace_repository_dependencies(
+            analyses,
+            selected.file,
+            selected.name,
         )
         decision, reason = decide_acquisition(finding, active_allowlist, complete)
 
-        slices = build_repository_slices(analyses, symbols) if decision == Decision.ACQUIRE else {}
+        slices = (
+            build_repository_slices(analyses, symbols, static_bindings)
+            if decision == Decision.ACQUIRE
+            else {}
+        )
         emitted_slice_bytes = sum(len(content) for content in slices.values())
 
         receipt = AnalysisReceipt(
@@ -96,6 +108,10 @@ def dissect(
             stdlib_imports=stdlib,
             third_party_imports=third_party,
             unresolved_project_imports=unresolved,
+            resolved_static_bindings=[
+                f"{file_name}::{binding_name}"
+                for file_name, binding_name in static_bindings
+            ],
             dependency_complete_v0_1=complete,
             license=finding,
             acquisition_allowlist=list(active_allowlist),

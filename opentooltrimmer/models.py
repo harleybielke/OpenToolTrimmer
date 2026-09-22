@@ -43,6 +43,7 @@ class AnalysisReceipt:
     stdlib_imports: list[str]
     third_party_imports: list[str]
     unresolved_project_imports: list[str]
+    resolved_static_bindings: list[str]
     dependency_complete_v0_1: bool
     license: LicenseFinding
     acquisition_allowlist: list[str]

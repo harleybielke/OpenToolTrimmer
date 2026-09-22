@@ -45,6 +45,7 @@ class FileAnalysis:
     tree: ast.Module
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]
     imports: dict[str, ImportBinding]  # alias -> (top module, project-local candidate)
+    module_bindings: dict[str, list[ast.AST]]
 
 
 def _terms(text: str) -> set[str]:
@@ -101,6 +102,22 @@ def _load_python_file(path: Path, repo: Path) -> FileAnalysis | None:
                     relative_level=node.level,
                 )
 
+    module_bindings: dict[str, list[ast.AST]] = {}
+    for statement in tree.body:
+        names = _module_statement_bound_names(statement)
+        names.update(_module_statement_potentially_mutated_names(statement))
+        for name in names:
+            module_bindings.setdefault(name, []).append(statement)
+        globally_rebound = {
+            name
+            for child in ast.walk(statement)
+            if isinstance(child, ast.Global)
+            for name in child.names
+        }
+        for name in globally_rebound:
+            if statement not in module_bindings.get(name, []):
+                module_bindings.setdefault(name, []).append(statement)
+
     return FileAnalysis(
         path,
         path.relative_to(repo).as_posix(),
@@ -110,7 +127,127 @@ def _load_python_file(path: Path, repo: Path) -> FileAnalysis | None:
         tree,
         functions,
         imports,
+        module_bindings,
     )
+
+
+def _module_statement_bound_names(statement: ast.stmt) -> set[str]:
+    """Collect bindings made by one module statement without entering scopes."""
+    bound: set[str] = set()
+
+    class BindingVisitor(ast.NodeVisitor):
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.add(node.id)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            bound.add(node.name)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            bound.add(node.name)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            bound.add(node.name)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            return
+
+        def visit_SetComp(self, node: ast.SetComp) -> None:
+            return
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            return
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            return
+
+    BindingVisitor().visit(statement)
+    return bound
+
+
+def _module_statement_potentially_mutated_names(statement: ast.stmt) -> set[str]:
+    """Conservatively reject bindings passed to or mutated by module code."""
+    mutated: set[str] = set()
+
+    def loaded_names(node: ast.AST) -> set[str]:
+        return {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+        }
+
+    class MutationVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Attribute):
+                mutated.update(loaded_names(node.func.value))
+            for argument in node.args:
+                mutated.update(loaded_names(argument))
+            for keyword in node.keywords:
+                mutated.update(loaded_names(keyword.value))
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                if isinstance(target, (ast.Attribute, ast.Subscript)):
+                    mutated.update(loaded_names(target))
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if isinstance(node.target, (ast.Attribute, ast.Subscript)):
+                mutated.update(loaded_names(node.target))
+            if node.value is not None:
+                self.visit(node.value)
+
+        def visit_Delete(self, node: ast.Delete) -> None:
+            for target in node.targets:
+                mutated.update(loaded_names(target))
+
+    MutationVisitor().visit(statement)
+    return mutated
+
+
+def _static_literal_binding(info: FileAnalysis, name: str) -> ast.AST | None:
+    """Prove one narrow direct module binding without evaluating source."""
+    bindings = info.module_bindings.get(name, [])
+    if len(bindings) != 1:
+        return None
+
+    node = bindings[0]
+    value: ast.AST | None = None
+    if (
+        isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == name
+    ):
+        value = node.value
+    elif (
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == name
+    ):
+        value = node.value
+
+    if not isinstance(value, ast.Constant):
+        return None
+    if type(value.value) not in {int, float, str, bytes, bool, type(None)}:
+        return None
+    return node
 
 
 def _python_files(repo: Path):
@@ -302,6 +439,7 @@ def trace_repository_dependencies(
     stdlib: set[str] = set()
     third_party: set[str] = set()
     unresolved_project: set[str] = set()
+    static_bindings: set[tuple[str, str]] = set()
 
     while queue:
         file_name, function_name = queue.pop(0)
@@ -326,7 +464,10 @@ def trace_repository_dependencies(
             | set(info.imports)
         )
         for name in sorted(_loaded_names(node) - proven_names):
-            unresolved_project.add(f"global:{info.relative}:{name}")
+            if _static_literal_binding(info, name) is not None:
+                static_bindings.add((info.relative, name))
+            else:
+                unresolved_project.add(f"global:{info.relative}:{name}")
 
         # Same-file calls.
         for name in sorted(called):
@@ -365,6 +506,7 @@ def trace_repository_dependencies(
         sorted(stdlib),
         sorted(third_party),
         sorted(unresolved_project),
+        sorted(static_bindings),
         dependency_complete,
     )
 
@@ -447,18 +589,23 @@ def build_slice(info: FileAnalysis, selected_name: str, helpers: list[str]) -> s
 def build_repository_slices(
     analyses: dict[str, FileAnalysis],
     symbols: list[tuple[str, str]],
+    static_bindings: list[tuple[str, str]],
 ) -> dict[str, bytes]:
     by_file: dict[str, list[str]] = {}
+    bindings_by_file: dict[str, list[str]] = {}
 
     for file_name, symbol_name in symbols:
         by_file.setdefault(file_name, []).append(symbol_name)
+    for file_name, binding_name in static_bindings:
+        bindings_by_file.setdefault(file_name, []).append(binding_name)
 
     output: dict[str, bytes] = {}
 
-    for file_name, names in by_file.items():
+    for file_name in sorted(set(by_file) | set(bindings_by_file)):
         info = analyses[file_name]
+        names = by_file.get(file_name, [])
         nodes = [info.functions[name] for name in names]
-        used = set().union(*(_used_names(node) for node in nodes))
+        used = set().union(*(_used_names(node) for node in nodes)) if nodes else set()
 
         pieces: list[bytes] = []
 
@@ -481,7 +628,12 @@ def build_repository_slices(
                 if any(name in used for name in bound_names):
                     pieces.append(_node_source_bytes(info, node))
 
-        for node in sorted(nodes, key=lambda item: item.lineno):
+        binding_nodes = [
+            _static_literal_binding(info, name)
+            for name in bindings_by_file.get(file_name, [])
+        ]
+        emitted_nodes = nodes + [node for node in binding_nodes if node is not None]
+        for node in sorted(emitted_nodes, key=lambda item: item.lineno):
             pieces.append(_node_source_bytes(info, node))
 
         newline = _source_newline(info.source_bytes)
