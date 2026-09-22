@@ -40,6 +40,8 @@ in the Software without restriction, subject to inclusion of this notice.
 THE SOFTWARE IS PROVIDED "AS IS".
 """)
 
+MIT_TITLES = frozenset({"mit license", "the mit license (mit)"})
+
 
 def _detect_spdx(text: str) -> tuple[str | None, str]:
     t = _normalize(text)
@@ -67,7 +69,7 @@ def _detect_spdx(text: str) -> tuple[str | None, str]:
             -1,
         )
         prefix_lines = lines[:permission_line] if permission_line >= 0 else []
-        valid_prefix = bool(prefix_lines) and _normalize(prefix_lines[0]) == "mit license"
+        valid_prefix = bool(prefix_lines) and _normalize(prefix_lines[0]) in MIT_TITLES
         if valid_prefix:
             valid_prefix = all(
                 re.fullmatch(

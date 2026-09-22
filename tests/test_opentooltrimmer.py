@@ -340,6 +340,77 @@ class OpenToolTrimmerTests(unittest.TestCase):
             self.assertEqual(receipt.verification_status, "NOT_RUN")
             self.assertFalse((root / "output" / "slice").exists())
 
+    def test_mit_title_variants_accept_the_same_canonical_body(self):
+        canonical = (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+        variants = {
+            "standard": canonical,
+            "expanded": canonical.replace(
+                b"MIT License", b"The MIT License (MIT)", 1
+            ),
+        }
+        for name, license_bytes in variants.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                repo = root / "repo"
+                _write_repo(
+                    repo,
+                    {
+                        "LICENSE": license_bytes,
+                        "cleaner.py": (
+                            b"def normalize_customer_name(value: str) -> str:\n"
+                            b"    return value.strip().lower()\n"
+                        ),
+                    },
+                )
+
+                receipt = dissect(
+                    str(repo), "normalize customer name", "utility", root / "output"
+                )
+
+                self.assertEqual(receipt.license.spdx_id, "MIT")
+                self.assertEqual(receipt.license.confidence, "high")
+                self.assertEqual(receipt.decision, Decision.ACQUIRE)
+
+    def test_expanded_mit_title_does_not_bypass_body_validation(self):
+        canonical = (FIXTURES / "permissive_repo" / "LICENSE").read_bytes()
+        expanded = canonical.replace(b"MIT License", b"The MIT License (MIT)", 1)
+        invalid_variants = {
+            "modified_body": expanded.replace(
+                b"without limitation the rights",
+                b"subject to additional limitations on the rights",
+                1,
+            ),
+            "extra_terms": expanded + b"\nUse requires separate written approval.\n",
+            "incomplete_mit_like": (
+                b"The MIT License (MIT)\n\n"
+                b"Copyright (c) 2026 Example Author\n\n"
+                b"Permission is hereby granted, free of charge, to use this software.\n"
+                b'THE SOFTWARE IS PROVIDED "AS IS".\n'
+            ),
+        }
+        for name, license_bytes in invalid_variants.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                repo = root / "repo"
+                _write_repo(
+                    repo,
+                    {
+                        "LICENSE": license_bytes,
+                        "cleaner.py": (
+                            b"def normalize_customer_name(value: str) -> str:\n"
+                            b"    return value.strip().lower()\n"
+                        ),
+                    },
+                )
+
+                receipt = dissect(
+                    str(repo), "normalize customer name", "utility", root / "output"
+                )
+
+                self.assertIsNone(receipt.license.spdx_id)
+                self.assertEqual(receipt.decision, Decision.HOLD)
+                self.assertFalse((root / "output" / "slice").exists())
+
     def test_comprehension_target_does_not_bind_enclosing_load(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
