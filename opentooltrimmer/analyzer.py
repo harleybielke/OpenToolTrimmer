@@ -413,17 +413,71 @@ def _module_candidates(module: str) -> list[str]:
 
 def _resolve_imported_function(
     analyses: dict[str, FileAnalysis],
+    importer: FileAnalysis,
     binding: ImportBinding,
 ) -> tuple[FileAnalysis, str] | None:
     if not binding.project_local or not binding.symbol:
         return None
 
-    for candidate in _module_candidates(binding.module):
+    module = binding.module
+    if binding.relative_level:
+        module = _proven_relative_module(analyses, importer, binding)
+        if module is None:
+            return None
+
+    candidates = _module_candidates(module)
+    if binding.relative_level:
+        existing_targets = [analyses[candidate] for candidate in candidates if candidate in analyses]
+        if len(existing_targets) != 1:
+            return None
+        target = existing_targets[0]
+        return (target, binding.symbol) if binding.symbol in target.functions else None
+
+    for candidate in candidates:
         info = analyses.get(candidate)
         if info and binding.symbol in info.functions:
             return info, binding.symbol
 
     return None
+
+
+def _proven_relative_module(
+    analyses: dict[str, FileAnalysis],
+    importer: FileAnalysis,
+    binding: ImportBinding,
+) -> str | None:
+    """Return a repository module name only when package ancestry proves it."""
+    # Boundary invariant: explicit relative project-local imports are resolved only
+    # when the importing file and conventional package ancestry prove one target.
+    # Failure to prove that target must continue to the existing unresolved/HOLD
+    # path. This seam may grow through additional bounded resolvers for other
+    # statically provable import forms; it must never grow by treating unresolved
+    # imports as safe. Constructed globals and registries (for example
+    # filetype.types.TYPES) are a separate dependency class and are not resolved here.
+    if not binding.module:
+        return None
+
+    importer_path = Path(importer.relative)
+    package_parts = list(importer_path.parent.parts)
+    if not package_parts:
+        return None
+
+    package_prefixes = [
+        "/".join(package_parts[:index]) + "/__init__.py"
+        for index in range(1, len(package_parts) + 1)
+    ]
+    if any(prefix not in analyses for prefix in package_prefixes):
+        return None
+
+    parents_to_leave = binding.relative_level - 1
+    if parents_to_leave >= len(package_parts):
+        return None
+
+    base_parts = package_parts[: len(package_parts) - parents_to_leave]
+    module_parts = binding.module.split(".")
+    if not all(module_parts):
+        return None
+    return ".".join([*base_parts, *module_parts])
 
 def trace_repository_dependencies(
     analyses: dict[str, FileAnalysis],
@@ -489,7 +543,7 @@ def trace_repository_dependencies(
 
                 continue
 
-            resolved = _resolve_imported_function(analyses, binding)
+            resolved = _resolve_imported_function(analyses, info, binding)
 
             if resolved:
                 target_info, target_name = resolved

@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from opentooltrimmer.analyzer import rank_candidates, trace_repository_dependencies
 from opentooltrimmer.cli import build_parser, main
 from opentooltrimmer.core import _verify_slice, dissect
 from opentooltrimmer.models import Decision
@@ -50,6 +51,21 @@ def _write_repo(repo: Path, files: dict[str, bytes]) -> None:
 
 
 class OpenToolTrimmerTests(unittest.TestCase):
+    def _trace_fixture_repository(
+        self,
+        root: Path,
+        files: dict[str, bytes],
+        need: str = "selected capability",
+    ):
+        repo = root / "repo"
+        _write_repo(repo, files)
+        candidates, analyses = rank_candidates(repo, need)
+        self.assertTrue(candidates)
+        selected = candidates[0]
+        return trace_repository_dependencies(
+            analyses, selected.file, selected.name
+        )
+
     def test_cli_requires_invocation_correlation(self):
         with self.assertRaises(SystemExit) as raised:
             build_parser().parse_args([
@@ -650,6 +666,109 @@ class OpenToolTrimmerTests(unittest.TestCase):
             
             self.assertTrue((slice_root / "cleaner.py").exists())
             self.assertTrue((slice_root / "helpers" / "__init__.py").exists())
+
+    def test_sibling_relative_import_resolves_and_traces_helper_closure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._trace_fixture_repository(
+                Path(temp),
+                {
+                    "pkg/__init__.py": b"",
+                    "pkg/selected.py": (
+                        b"from .utils import helper\n\n"
+                        b"def selected_capability(value):\n"
+                        b"    return helper(value)\n"
+                    ),
+                    "pkg/utils.py": (
+                        b"def normalize(value):\n"
+                        b"    return value.strip()\n\n"
+                        b"def helper(value):\n"
+                        b"    return normalize(value)\n"
+                    ),
+                },
+            )
+            symbols, _stdlib, _third_party, unresolved, _bindings, complete = result
+
+            self.assertIn(("pkg/utils.py", "helper"), symbols)
+            self.assertIn(("pkg/utils.py", "normalize"), symbols)
+            self.assertEqual([], unresolved)
+            self.assertTrue(complete)
+
+    def test_parent_relative_import_resolves_when_package_ancestry_is_proven(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._trace_fixture_repository(
+                Path(temp),
+                {
+                    "pkg/__init__.py": b"",
+                    "pkg/sub/__init__.py": b"",
+                    "pkg/sub/selected.py": (
+                        b"from ..utils import helper\n\n"
+                        b"def selected_capability(value):\n"
+                        b"    return helper(value)\n"
+                    ),
+                    "pkg/utils.py": b"def helper(value):\n    return value.strip()\n",
+                },
+            )
+            symbols, _stdlib, _third_party, unresolved, _bindings, complete = result
+
+            self.assertIn(("pkg/utils.py", "helper"), symbols)
+            self.assertEqual([], unresolved)
+            self.assertTrue(complete)
+
+    def test_missing_relative_target_remains_unresolved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._trace_fixture_repository(
+                Path(temp),
+                {
+                    "pkg/__init__.py": b"",
+                    "pkg/selected.py": (
+                        b"from .missing import helper\n\n"
+                        b"def selected_capability(value):\n"
+                        b"    return helper(value)\n"
+                    ),
+                },
+            )
+            _symbols, _stdlib, _third_party, unresolved, _bindings, complete = result
+
+            self.assertEqual(["missing:helper"], unresolved)
+            self.assertFalse(complete)
+
+    def test_relative_import_without_proven_package_remains_unresolved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._trace_fixture_repository(
+                Path(temp),
+                {
+                    "pkg/selected.py": (
+                        b"from .utils import helper\n\n"
+                        b"def selected_capability(value):\n"
+                        b"    return helper(value)\n"
+                    ),
+                    "pkg/utils.py": b"def helper(value):\n    return value.strip()\n",
+                },
+            )
+            _symbols, _stdlib, _third_party, unresolved, _bindings, complete = result
+
+            self.assertEqual(["utils:helper"], unresolved)
+            self.assertFalse(complete)
+
+    def test_ambiguous_relative_module_identity_remains_unresolved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = self._trace_fixture_repository(
+                Path(temp),
+                {
+                    "pkg/__init__.py": b"",
+                    "pkg/selected.py": (
+                        b"from .utils import helper\n\n"
+                        b"def selected_capability(value):\n"
+                        b"    return helper(value)\n"
+                    ),
+                    "pkg/utils.py": b"def helper(value):\n    return value.strip()\n",
+                    "pkg/utils/__init__.py": b"def helper(value):\n    return value.lower()\n",
+                },
+            )
+            _symbols, _stdlib, _third_party, unresolved, _bindings, complete = result
+
+            self.assertEqual(["utils:helper"], unresolved)
+            self.assertFalse(complete)
 
     def test_module_attribute_project_dependency_holds(self):
         with tempfile.TemporaryDirectory() as temp:
